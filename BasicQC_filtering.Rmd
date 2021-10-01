@@ -1,0 +1,616 @@
+---
+title: "QC"
+author: "Ashfaq Ali"
+date: "9/17/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = TRUE, fig.height=6, fig.width=9)
+```
+
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(tidyr)
+  library(cowplot)
+  library(ggplot2)
+  library(scran)
+  library(hdf5r)
+    library(scales)
+    library(fields)
+    library(data.table)
+  library(tinytex)
+    library(dplyr)
+})
+
+```
+
+
+
+# 0. Data import
+
+
+## Data provided in RDs objects
+The raw data from the 10X h5 files was provided in "combined_01_data.rds" file
+```{r data}
+astro_raw <- readRDS("../data/RData/combined_01_data.rds")
+```
+
+```{r}
+# Add number of genes per UMI for each cell to metadata
+astro_raw$log10GenesPerUMI <- log10(astro_raw$nFeature_RNA) / log10(astro_raw$nCount_RNA)
+astro_raw$mitoPercent <- PercentageFeatureSet(object = astro_raw, pattern = "^Mt-")
+astro_raw$mitoRatio <- astro_raw@meta.data$mitoPercent / 100
+metadata <- astro_raw@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+        dplyr::rename(seq_folder = orig.ident,
+                      nUMI = nCount_RNA,
+                      nGene = nFeature_RNA)
+```
+
+```{r}
+# Create sample column
+metadata$sample <- metadata$age
+```
+
+## Number of cells
+
+```{r}
+p1 <- metadata %>% 
+  	ggplot(aes(x=sample, fill=sample)) + 
+  	geom_bar() +
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells")
+ggsave("QC_plots/Cell_counts.png", p1)
+```
+
+## UMI counts (transcripts/nCount_RNA) per cell
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+p2 <- metadata %>% 
+  	ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 500)
+ggsave("QC_plots/transcripts_counts_per_cell.png", p2)
+```
+
+
+```{r}
+# Visualize the distribution of genes detected per cell via histogram
+p3 <- metadata %>% 
+  	ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 300)
+ggsave("QC_plots/gens_per_cell_hist.png", p3)
+# Visualize the distribution of genes detected per cell via boxplot
+p4 <- metadata %>% 
+  	ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  	geom_boxplot() + 
+  	theme_classic() +
+  	theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  	theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  	ggtitle("NCells vs NGenes")
+ggsave("QC_plots/genes_detected_boxplot.png", p4)
+```
+
+
+```{r}
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+p5 <- metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 500) +
+  	geom_hline(yintercept = 250) +
+  	facet_wrap(~sample)
+ggsave("QC_plots/genes_umi_correlation.png", p5)
+```
+
+## Mitochondrial counts ratio
+
+```{r}
+# Visualize the distribution of mitochondrial gene expression detected per cell
+p6 <- metadata %>% 
+  	ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 0.01)
+ggsave("QC_plots/mitoChondrial_genEX_oer_cell.png", p6)
+```
+
+## Complexity
+```{r}
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+p7 <- metadata %>%
+  	ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  	geom_density(alpha = 0.2) +
+  	theme_classic() +
+  	geom_vline(xintercept = 0.8)
+ggsave("QC_plots/complexity_genes_per_UMI.png", p7)
+```
+
+```{r Metadata fetures pre-qc 1}
+feats <- c( "nCount_RNA"  , "nFeature_RNA", "percent.mt")
+VlnPlot(astro_raw, group.by= "orig.ident", features = feats, pt.size = .2,ncol = 4,cols = c("navyblue" ) ) + NoLegend()
+```
+
+## Cell Cycle scoring
+
+
+# Step 1 - QC
+
+```{r Calculate %Mitochondrial, Ribosomal, red blood cells and platelet genes}
+dim(HT5)
+HT5 <- PercentageFeatureSet(HT5, "^MT-", col.name = "percent_mito")
+HT5 <- PercentageFeatureSet(HT5, "^RP[SL]", col.name = "percent_ribo")
+HT5 <- PercentageFeatureSet(HT5, "^HB[^(P)]", col.name = "percent_hb")
+HT5 <- PercentageFeatureSet(HT5, "PECAM1|PF4", col.name = "percent_plat")
+```
+
+```{r Histo Feats and counts pre-qc}
+hist(astro_raw$nFeature_RNA, breaks = 50, )
+hist(HT5$nCount_RNA, breaks = 50)
+```
+
+```{r Metadata fetures pre-qc 1}
+feats <- c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo")
+p8 <- VlnPlot(astro_raw, group.by= "orig.ident", split.by = "age", features = feats, pt.size = .2,ncol = 4,cols = c("navyblue", "darkred") ) + NoLegend()
+ggsave("QC_plots/Violin.png", p8)
+```
+
+
+```{r Metadata fetures pre-qc 2, fig.height=9, fig.width=12}
+p9 <- cowplot::plot_grid(ncol = 3,nrow = 1,
+  FeatureScatter(astro_raw, feature1 = "nCount_RNA"  , feature2 = "nFeature_RNA", group.by = "orig.ident", pt.size = .2),
+  FeatureScatter(astro_raw, "percent.mt", "nFeature_RNA", group.by = "orig.ident", pt.size = .2),
+  FeatureScatter(astro_raw, "percent.mt", "nCount_RNA", group.by = "orig.ident", pt.size = .2)
+  
+)
+ggsave("QC_plots/Feature_Count_correlations.png", p9, width = 12, height = 7)
+
+```
+
+
+```{r Filter cells according to features and counts}
+selected_c <- WhichCells(astro_raw, expression = nFeature_RNA > 500 & nFeature_RNA < 6500 & nCount_RNA < 35000)
+selected_f <- rownames(astro_raw)[ Matrix::rowSums(astro_raw) > 3]
+data.filt <- subset(astro_raw, cells=selected_c, features=selected_f)
+dim(astro_raw)
+dim(data.filt)
+```
+
+
+
+```{r Metadata fetures pre-qc 1}
+feats <- c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo")
+p10 <- VlnPlot(data.filt, group.by= "orig.ident", split.by = "age", features = feats, pt.size = .2,ncol = 4,cols = c("navyblue", "darkred") ) + NoLegend()
+ggsave("QC_plots/Violin_filt.png", p10)
+```
+
+
+```{r Filter cells according to mito and ribosomal genes}
+selected_mito <- WhichCells(data.filt, expression = percent.mt < 25)
+#selected_ribo <- WhichCells(data.filt, expression = percent_ribo > 2 & percent_ribo < 50)
+
+# and subset the object to only keep those cells
+data.filt <- subset(data.filt, cells = selected_mito)
+#data.filt <- subset(data.filt, cells = selected_ribo)
+dim(data.filt)
+```
+
+```{r Metadata fetures after-qc 1}
+p11 <- VlnPlot(data.filt, group.by= "orig.ident", split.by = "age",features = feats, pt.size =.2, ncol = 4,cols = c("navyblue", "darkred" ) ) + NoLegend()
+ggsave("QC_plots/Violin_filt_mit25.png", p11)
+```
+
+```{r}
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  	ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 500)
+```
+
+## Remove doublets
+
+The doubletfinder requires itself to be run individually on samples and therefor each sample has to be loaded individually and QC'd further.
+
+
+```{r doubletfinder, message=FALSE}
+library(DoubletFinder)
+#data.filt <- CreateSeuratObject(data.filt)
+dataList <- data.filt
+dataList <- SplitObject(data.filt, split.by = "orig.ident")
+
+dataList <- lapply(dataList, NormalizeData)
+dataList <- lapply(dataList, FindVariableFeatures, selection.method = "vst", nfeatures = 2000)
+dataList <- lapply(dataList, ScaleData )
+
+dataList <- lapply(dataList,RunPCA)
+dataList <- lapply(dataList,RunUMAP,  dims = 1:10)
+
+
+nExp = lapply(
+  dataList,
+  function(x) 
+  {
+    y <- round(ncol(x)*0.02)
+    
+    y
+  }
+)
+#nExp <- lapply(data.filt, function(x), round(ncol(x=data.filt)* 0.02) # expect 1% doublets
+# dataList[[i]] <- for (i in 1:length(nExp)) {
+#     dataList[[i]] <- doubletFinder_v3(dataList[[i]] , pN=0.25, pK = 0.09, nExp = nExp[[i]], PCs = 1:10)
+# }
+
+dataList <- lapply(data.filt, function(x){
+    y <- doubletFinder_v3(x,  pN=0.25, pK = 0.09, nExp = nExp[[i]], PCs = 1:10)
+    y
+}
+)
+```
+
+```{r}
+# name of the DF prediction can change, so extract the correct column name.
+DF.name = lapply(dataList, function(x){
+    y <- colnames(x@meta.data)
+    y[grepl("DF.classifications", y)]
+}
+)
+```
+
+
+```{r}
+## Print the plost to files
+
+for(i in 1:length(DF.name))
+    {
+      p <-  DimPlot(dataList[[i]], group.by = DF.name[[i]]) + NoAxes()
+    v <-    VlnPlot(dataList[[i]], features = "nCount_RNA", group.by = DF.name[[i]], pt.size = .1)
+    vf <-    VlnPlot(dataList[[i]], features = "nFeature_RNA", group.by = DF.name[[i]], pt.size = .1)
+     ggsave(paste0(names(DF.name[i]),".png"), p)
+     ggsave(paste0(names(DF.name[i]),"v.png"), v)
+     ggsave(paste0(names(DF.name[i]),"vf.png"), vf)
+    }
+
+
+
+```
+
+```{r Violin plot singlets vs doublets}
+VlnPlot(data.filt, features = "nFeature_RNA", group.by = DF.name, pt.size = .1)
+```
+
+
+```{r Filter out doublets, eval=FALSE}
+#data.filt = data.filt[,data.filt@meta.data[,DF.name] == "Singlet"]
+#dim(data.filt)
+```
+
+```{r Canonical leuko  markers, fig.height=9, fig.width=12}
+myfeatures <- c("CD3E", "CD4", "CD8A", "NKG7", "GNLY", "MS4A1", "CD14", "LYZ", "MS4A7", "FCGR3A", "CST3", "FCER1A", "CLEC10A")
+FeaturePlot(data.filt,
+  reduction = "tsne", dims = 1:2,
+  features = myfeatures, ncol = 3, order = T
+)
+```
+
+
+
+
+```{r Metadata fetures after-qc 2}
+hist(data.filt$nFeature_RNA, breaks = 50)
+hist(data.filt$nCount_RNA, breaks = 50)
+```
+
+```{r discard mitochondrial and ribosomal genes and malat 1 to reduce noise}
+data.filt <- data.filt[ ! grepl("^MT-", rownames(data.filt)), ]
+data.filt <- data.filt[ ! grepl("^RP[SL]", rownames(data.filt)), ]
+data.filt <- data.filt[ ! grepl("MALAT1", rownames(data.filt)), ]
+dim(data.filt)
+```
+
+```{r Most expressed transcripts, fig.height=9, fig.width=12}
+#Compute the relative expression of each gene per cell
+rel_expression <- t( t(data.filt@assays$RNA@counts) / Matrix::colSums(data.filt@assays$RNA@counts)) * 100
+most_expressed <- sort(Matrix::rowSums( rel_expression ),T)[50:1] / ncol(data.filt)
+
+#par = par(mar=c(8,8,1,1))
+
+#png(filename = file.path(opt$output_path, "MostExpressed.png"), width = 18 , height = 25, units = "cm", res = 300)
+#par(cex.lab=0.1)
+boxplot( as.matrix(t(rel_expression[names(most_expressed),])),cex=0.1, las=1, pch=19,xlab="% total count per cell",col=scales::hue_pal()(50)[50:1],horizontal=TRUE, cex.axis=0.6)
+#dev.off()
+```
+
+
+## Cell Cycle scoring
+
+Before running cell cycle score the data has to be normalized
+```{r Normalize counts before running cellcycle score, results='hide'}
+data.filt <- NormalizeData(data.filt)
+```
+
+```{r Calculate cell cycle scores}
+data.filt <- CellCycleScoring(object = data.filt,
+                              g2m.features = cc.genes$g2m.genes,
+                              s.features = cc.genes$s.genes)
+
+VlnPlot(data.filt, features = c("S.Score","G2M.Score"), group.by= "orig.ident",ncol = 4, pt.size = .2)
+```
+
+
+```{r Manual Doublet filtering, eval=FALSE}
+selected_c2 <- WhichCells(data.filt, expression = nCount_RNA > 20000 & S.Score < 0.1 & G2M.Score < 0.1, invert = T)
+data.filt <- subset(data.filt, cells = selected_c2)
+dim(data.filt)
+```
+
+```{r Remove T and B cell contamination}
+dim(data.filt)
+selected_noTBNKcell <- WhichCells(data.filt, expression = CD3D < 0.1 & CD3E < 0.1 & CD3G < 0.1 & CD8A < 0.1 & CD8B < 0.1 & TIGIT < 0.1 & CD19 < 0.1 & MS4A1 < 0.1 & KLRB1 < 0.1 & CD7 < 0.1 & GNLY < 0.1 & CTLA4 < 0.1)
+data.filt <- subset(data.filt, cells = selected_noTBNKcell)
+dim(data.filt)
+```
+
+
+
+```{r HT5 dataset QCed with Mast Cell}
+saveRDS(data.filt, "C:/Users/David/Box/SingleCell_David/Data/HT5_qc.rds")
+```
+
+#  STEP 2 - Dimensionality Reduction
+
+
+
+```{r Top 20 variable features}
+suppressWarnings(suppressMessages(data.filt <- FindVariableFeatures(data.filt, selection.method = "vst", nfeatures = 2000 ,verbose = FALSE,assay = "RNA")))
+top20 <- head(VariableFeatures(data.filt), 20)
+
+LabelPoints(plot = VariableFeaturePlot(data.filt), points = top20, repel = TRUE)
+```
+
+### Regress for confounding variable
+
+We wont to remove effects of library size and mitochondrial contamination.
+```{r}
+data.filt <- ScaleData(data.filt, vars.to.regress = c("percent_mito", "nCount_RNA"), assay = "RNA")
+```
+
+```{r PCA}
+data.filt <- RunPCA(data.filt, npcs = 50, verbose = F)
+plot_grid(ncol = 3,
+  DimPlot(data.filt, reduction = "pca", group.by = "orig.ident",dims = 1:2) + NoLegend(),
+  DimPlot(data.filt, reduction = "pca", group.by = "orig.ident",dims = 3:4)+ NoLegend(),
+  DimPlot(data.filt, reduction = "pca", group.by = "orig.ident",dims = 5:6)+ NoLegend())
+```
+
+
+```{r PCA 2, fig.height=9, fig.width=12}
+VizDimLoadings(data.filt, dims = 1:5, reduction = "pca",ncol = 5,balanced = T)
+```
+
+
+```{r}
+ElbowPlot(data.filt, reduction = "pca",ndims = 50)
+```
+
+
+```{r DRs tested, message=FALSE, warning=FALSE, error=FALSE}
+data.filt <- RunTSNE(data.filt,reduction.name = "tsne", reduction = "pca", dims = 1:30, 
+                   perplexity=30,
+                   max_iter=1000,
+                   theta=0.5,
+                   eta=200,
+                   num_threads=0 )
+
+data.filt <- RunUMAP(data.filt, reduction.name = "UMAP10", # Be ware that custom names needs to be specified in the future use of functions where applicable.
+                   reduction = "pca", 
+                   dims = 1:30,
+                   n.components=10,
+                   n.neighbors=30,
+                   n.epochs=200,
+                   min.dist=0.3,
+                   learning.rate=1,
+                   spread=0.2 )
+
+data.filt <- RunUMAP(data.filt, reduction.name = "UMAP20",
+                   reduction = "pca", 
+                   dims = 1:30,
+                   n.components=20,
+                   n.neighbors=30,
+                   n.epochs=200,
+                   min.dist=0.3,
+                   learning.rate=1,
+                   spread=0.2 )
+```
+
+```{r DR grids}
+plot_grid(ncol = 3,
+  DimPlot(data.filt, reduction = "tsne", group.by = "orig.ident")+ ggplot2::ggtitle(label ="tSNE")+ NoLegend(),
+  DimPlot(data.filt, reduction = "UMAP10", group.by = "orig.ident",dims = 1:2)+ ggplot2::ggtitle(label ="UMAP10")+ NoLegend(),
+  DimPlot(data.filt, reduction = "UMAP20", group.by = "orig.ident",dims = 1:2)+ ggplot2::ggtitle(label ="UMAP20")+ NoLegend()
+)
+```
+
+
+```{r UMAP on 2000 HVGs, message=FALSE, warning=FALSE, error=FALSE}
+data.filt <- RunUMAP(data.filt, reduction.name = "UMAP20_on_2000HVGs",
+                   features = data.filt@assays$RNA@var.features,
+                   assay = "RNA",
+                   n.components=20,
+                   n.neighbors=30,
+                   n.epochs=200,
+                   min.dist=0.3,
+                   learning.rate=1,
+                   spread=0.2 )
+```
+
+
+
+
+```{r UMAP 20 vs UMAP 2000 HVGs}
+plot_grid(ncol = 2,
+  DimPlot(data.filt, reduction = "UMAP20", group.by = "orig.ident",dims = 1:2)+ ggplot2::ggtitle(label ="UMAP20")+ NoLegend(),
+  DimPlot(data.filt, reduction = "UMAP20_on_2000HVGs", group.by = "orig.ident",dims = 1:2)+ ggplot2::ggtitle(label ="UMAP20_on_2000HVGs")+ NoLegend()
+)
+```
+
+
+
+
+
+# Step 4. Clustering
+
+```{r Calculate shared neighbors, message=FALSE}
+data.filt <- FindNeighbors(data.filt,
+                         reduction = "pca",
+                         graph.name = "SNN",
+                         assay = "RNA",
+                         dims = 1:20,
+                         k.param = 20)
+
+```
+
+```{r}
+library(clustree)
+```
+
+```{r Clustree plot, results='hide',  message=FALSE, warning=FALSE, error=FALSE, fig.height=9, fig.width=12}
+
+## Play with different resolution to clasiify cells.
+DefaultAssay(data.filt) <- "RNA"
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .1, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .2, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .3, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .4, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .5, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .6, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .7, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .8, algorithm = 1)
+data.filt <- FindClusters(data.filt, graph.name = "SNN", resolution = .9, algorithm = 1)
+clustree(data.filt, prefix = "SNN_res.", node_size_range = c(8,20), node_label_size = 8)
+```
+
+```{r Visualize clusters in the DR grid}
+plot_grid(ncol = 3,
+  DimPlot(data.filt, reduction = "tsne", group.by = "SNN_res.0.1", label = T)+ggtitle("louvain_0.1") + NoLegend(), 
+  DimPlot(data.filt, reduction = "tsne", group.by = "SNN_res.0.3", label = T) +ggtitle("louvain_0.3")+ NoLegend(),
+  DimPlot(data.filt, reduction = "tsne", group.by = "SNN_res.0.6", label = T)+ggtitle("louvain_0.6")+ NoLegend()
+)
+```
+
+### Cell Signature genes:
+Once we have some idea about the cell types from the PI, we can perhaps try to annotate the clusters.
+https://doi.org/10.3389/fimmu.2018.02193
+```{r Mast cell signature genes}
+MastCellSignGenes <- toupper(c("TPSAB1","HDC","KIT", "HPGDS", "FCER1A", "GATA2"))
+FeaturePlot(data.filt, reduction = "tsne",dims = 1:2,
+            features = MastCellSignGenes,ncol = 3,order = T)
+```
+
+
+## Differential Expression
+
+## Explore Louvain 0.1
+Calculate DEG among the clusters, using the RNA assay (all the genes)
+```{r}
+DefaultAssay(data.filt) <- "RNA"
+data.filt@active.ident = data.filt$SNN_res.0.1
+markers.1 = FindAllMarkers(data.filt,only.pos=T, test.use = "wilcox" )
+```
+
+```{r top 10 upregulated DEG 1 ,fig.height=12, fig.width=20}
+per.cluster.1 = split(markers.1$gene, markers.1$cluster)
+top10.1 = lapply(per.cluster.1, function(x) x[1:10])
+DotPlot(data.filt, features = unique(unlist(top10.1)), assay = "RNA", dot.scale = 6) + RotatedAxis() + theme(axis.text=element_text(size=8)) + theme(legend.text=element_text(size=9))
+```
+
+## Explore Louvain 0.6
+
+Calculate DEG among the clusters, using the RNA assay (all the genes)
+```{r}
+DefaultAssay(data.filt) <- "RNA"
+data.filt@active.ident = data.filt$SNN_res.0.6
+markers.5 = FindAllMarkers(data.filt,only.pos=T, test.use = "wilcox" )
+```
+
+```{r top 10 upregulated DEG ,fig.height=12, fig.width=20}
+per.cluster.5 = split(markers.5$gene, markers.5$cluster)
+top10.5 = lapply(per.cluster.5, function(x) x[1:10])
+DotPlot(data.filt, features = unique(unlist(top10.5)), assay = "RNA", dot.scale = 6) + RotatedAxis() + theme(axis.text=element_text(size=8)) + theme(legend.text=element_text(size=9))
+```
+
+
+```{r frequency of clusters in the sample, Table and contingency column graph, fig.height=6, fig.width=6}
+library(RColorBrewer)
+pt <- table(Idents(data.filt), data.filt$orig.ident)
+pt # Table
+pt <- as.data.frame(pt)
+pt$Var1 <- as.character(pt$Var1)
+
+ggplot(pt, aes(x = Var2, y = Freq, fill = Var1)) + # Graph
+  theme_bw(base_size = 15) +
+  geom_col(position = "fill", width = 0.5) +
+  xlab("Sample") +
+  ylab("Frequency") +
+  # scale_fill_manual(values = brewer.pal(20, "Paired")) +
+  theme(legend.title = element_blank())
+```
+
+
+```{r Feats to identify contamination , fig.height=9, fig.width=12}
+feats1 <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo")
+cont <- c("CD3E", "CD3G", "CD8A", "MS4A1",  "CD19", "CD79A", "HLA-DRA", "CD14")
+
+VlnPlot(data.filt, group.by = "SNN_res.0.6", features = feats1, pt.size = 0.3, ncol = 4, ) + NoLegend()
+VlnPlot(data.filt, features = c("S.Score", "G2M.Score"), group.by = "SNN_res.0.6", ncol = 4, pt.size = .1)
+VlnPlot(data.filt, features = cont, group.by = "SNN_res.0.6", ncol = 3, pt.size = .1)
+FeaturePlot(data.filt, features = cont, reduction = "tsne")
+```
+
+```{r}
+DimPlot(data.filt, reduction = "tsne", group.by = "SNN_res.0.6", label = T)+ggtitle("Clusters louvain_0.6")
+FeaturePlot(data.filt, features = c("nCount_RNA", "nFeature_RNA", "percent_mito", "percent_ribo", "G2M.Score", "S.Score"), reduction = "tsne")
+```
+
+
+```{r Metadata and canonical markers}
+feats1 <- c("nFeature_RNA","nCount_RNA","percent_mito","percent_ribo")
+featDC1ProgActDC <- c("CLEC9A", "XCR1", "CADM1", "TOP2A", "MKI67", "CDK1") 
+
+
+VlnPlot(data.filt, group.by= "SNN_res.0.6", features = feats1, pt.size = 0.2, ncol = 4,) + NoLegend()
+VlnPlot(data.filt, group.by= "orig.ident", features = feats1, pt.size = 0.2, ncol = 4,) + NoLegend()
+VlnPlot(data.filt, features = c("S.Score","G2M.Score"), group.by= "SNN_res.0.6",ncol = 4, pt.size = .1)
+VlnPlot(data.filt, features = featDC1ProgActDC, group.by= "SNN_res.0.6",ncol = 3, pt.size = .1)
+
+```
+
+
+
+
